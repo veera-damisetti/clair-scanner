@@ -389,28 +389,61 @@ else
 fi
 
 # ---------------------------------------------------------
-# Step 6: Start Clair Combo Container (v4.7.4)
+# Step 6: Start Local Image Registry (must be up before Clair on macOS)
 # ---------------------------------------------------------
-echo "=== Step 6: Starting Clair Combo (v4.7.4) ==="
-# --restart=on-failure:10 lets Clair self-heal if Postgres isn't fully
-# ready on the bridge network when Clair first tries to connect.
+# The registry must start before Clair so that on macOS, Clair's container
+# can reach it via host.containers.internal:5050 for layer fetching.
+echo "=== Step 6: Starting Local Image Registry ==="
+"${CONTAINER_ENGINE}" run -d --name local-registry \
+  "${NET_ARGS[@]}" \
+  "${REGISTRY_PUBLISH_ARGS[@]}" \
+  docker.io/library/registry:2
+
+local_registry_ready=false
+for i in {1..10}; do
+  if curl -s http://127.0.0.1:5050/v2/ &>/dev/null; then
+    echo "Local registry is up on 127.0.0.1:5050!"
+    local_registry_ready=true
+    break
+  fi
+  sleep 1
+done
+
+if [ "${local_registry_ready}" = "false" ]; then
+  echo "Error: Local registry failed to start."
+  exit 1
+fi
+
+# ---------------------------------------------------------
+# Step 7: Start Clair Combo Container (v4.7.4)
+# ---------------------------------------------------------
+echo "=== Step 7: Starting Clair Combo (v4.7.4) ==="
+
+# On macOS (bridge networking), Clair fetches image layers from inside its
+# own container. It cannot use 127.0.0.1:5050 (that's the host-side port).
+# --add-host=host.containers.internal:host-gateway makes the host's
+# 127.0.0.1 reachable from inside the container as host.containers.internal.
+# We later rewrite manifest layer URLs to use that hostname before submitting
+# to Clair's indexer API.
+CLAIR_EXTRA_ARGS=()
+if [ "${HOST_OS}" != "linux" ]; then
+  CLAIR_EXTRA_ARGS+=(--add-host=host.containers.internal:host-gateway)
+fi
+
 "${CONTAINER_ENGINE}" run -d --name clair \
   --restart=on-failure:10 \
   "${NET_ARGS[@]}" \
   "${CLAIR_PUBLISH_ARGS[@]}" \
+  "${CLAIR_EXTRA_ARGS[@]}" \
   -v "${CLAIR_STACK_DIR}/config.yaml:/config/config.yaml:ro,z" \
   -e CLAIR_MODE=combo \
   quay.io/projectquay/clair:4.7.4 \
   -conf /config/config.yaml
 
-# Health-check strategy:
-#   - /indexer/api/v1/index_states returns HTTP 200 once Clair's indexer
-#     is fully initialised and connected to Postgres.
-#   - We also accept any 2xx/4xx on the indexer root (Clair is up even if
-#     the DB is still migrating; it will serve requests).
-#   - 8089 (introspection) is NOT used — it always reports OK even when
-#     Clair is crashed.
-#   - 60 × 5s = 5 minutes total budget, enough for cold-start + DB setup.
+# Health-check: /indexer/api/v1/index_states returns HTTP 200 once Clair's
+# indexer is fully initialised and connected to Postgres.
+# 8089 (introspection) is NOT used — it always reports OK even when crashed.
+# 60 × 5s = 5 minutes total budget.
 echo "Waiting for Clair health check (API on :6060)..."
 local_clair_ready=false
 for i in {1..60}; do
@@ -451,30 +484,6 @@ while true; do
   echo "Database is still populating/updating. This may take 3-5 minutes on the very first run. Retrying in 15s..."
   sleep 15
 done
-
-# ---------------------------------------------------------
-# Step 7: Start Local Image Registry
-# ---------------------------------------------------------
-echo "=== Step 7: Starting Local Image Registry ==="
-"${CONTAINER_ENGINE}" run -d --name local-registry \
-  "${NET_ARGS[@]}" \
-  "${REGISTRY_PUBLISH_ARGS[@]}" \
-  docker.io/library/registry:2
-
-local_registry_ready=false
-for i in {1..10}; do
-  if curl -s http://127.0.0.1:5050/v2/ &>/dev/null; then
-    echo "Local registry is up on 127.0.0.1:5050!"
-    local_registry_ready=true
-    break
-  fi
-  sleep 1
-done
-
-if [ "${local_registry_ready}" = "false" ]; then
-  echo "Error: Local registry failed to start."
-  exit 1
-fi
 
 # ---------------------------------------------------------
 # Step 8: Skopeo copy images to local registry
@@ -533,28 +542,130 @@ skopeo inspect --tls-verify=false "docker://127.0.0.1:5050/target-image:x86_64" 
 echo "x86_64 metadata collected."
 
 # ---------------------------------------------------------
-# Step 10: Scan both images with clairctl
+# Step 10: Scan both images with Clair
 # ---------------------------------------------------------
-echo "=== Step 10: Scanning images with clairctl ==="
+# On Linux (--network=host) clairctl can submit 127.0.0.1:5050 directly —
+# Clair's indexer also sees 127.0.0.1:5050 and fetches layers fine.
+#
+# On macOS (bridge network), Clair's container cannot reach 127.0.0.1:5050
+# (that is a host-side port mapping). We use a two-step approach:
+#   1. clairctl manifest builds the manifest JSON (host sees 127.0.0.1:5050 ✓)
+#   2. Python rewrites layer URLs: 127.0.0.1:5050 → host.containers.internal:5050
+#      (the Clair container can reach that via --add-host added above)
+#   3. POST the rewritten manifest to Clair's indexer REST API directly
+#   4. Poll until indexing is complete, then fetch the vuln report
+echo "=== Step 10: Scanning images with Clair ==="
 REPORT_S390X="/tmp/clair-report-s390x-$$.json"
 REPORT_X86="/tmp/clair-report-x86-$$.json"
 
+# Helper: submit one image to Clair and write the vuln report JSON.
+# Usage: clair_scan <tag> <report_output_file>
+clair_scan() {
+  local tag="$1"
+  local out="$2"
+  local host_ref="127.0.0.1:5050/target-image:${tag}"
+  local clair_api="http://127.0.0.1:6060"
+
+  echo "Building manifest for ${tag}..."
+  local manifest_file="/tmp/clair-manifest-${tag}-$$.json"
+
+  if [ "${HOST_OS}" = "linux" ]; then
+    # Linux: submit directly via clairctl (network=host, no URL rewrite needed)
+    "${CLAIRCTL_BIN}" report \
+      --host "${clair_api}/" \
+      --out json \
+      "${host_ref}" > "${out}" \
+      || { echo "Error: clairctl failed to scan ${tag} image."; return 1; }
+    return 0
+  fi
+
+  # macOS: clairctl manifest → rewrite URLs → POST to indexer → poll → fetch report
+  "${CLAIRCTL_BIN}" manifest "${host_ref}" > "${manifest_file}" 2>/dev/null \
+    || { echo "Error: clairctl manifest failed for ${tag}."; return 1; }
+
+  # Rewrite 127.0.0.1:5050 → host.containers.internal:5050 in layer URLs
+  python3 - "${manifest_file}" << 'PYEOF'
+import sys, json
+path = sys.argv[1]
+with open(path) as f:
+    m = json.load(f)
+for layer in m.get("layers", []):
+    if "uri" in layer:
+        layer["uri"] = layer["uri"].replace(
+            "127.0.0.1:5050", "host.containers.internal:5050"
+        )
+with open(path, "w") as f:
+    json.dump(m, f)
+PYEOF
+
+  # Extract the manifest digest (the "hash" field)
+  local digest
+  digest=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['hash'])" \
+    "${manifest_file}" 2>/dev/null) \
+    || { echo "Error: could not extract manifest digest for ${tag}."; return 1; }
+  echo "Submitting manifest ${digest} to Clair indexer..."
+
+  # POST manifest to indexer
+  local http_code
+  http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X POST "${clair_api}/indexer/api/v1/index_report" \
+    -H "Content-Type: application/json" \
+    --data-binary "@${manifest_file}")
+  if [[ ! "${http_code}" =~ ^2 ]]; then
+    echo "Error: indexer POST returned HTTP ${http_code} for ${tag}."
+    curl -s -X POST "${clair_api}/indexer/api/v1/index_report" \
+      -H "Content-Type: application/json" \
+      --data-binary "@${manifest_file}" | python3 -m json.tool 2>/dev/null || true
+    return 1
+  fi
+  echo "Indexing started (HTTP ${http_code}). Waiting for completion..."
+
+  # Poll until state == IndexFinished or IndexError
+  local state=""
+  for i in {1..120}; do
+    state=$(curl -s "${clair_api}/indexer/api/v1/index_report/${digest}" \
+      | python3 -c "import sys,json; r=json.load(sys.stdin); print(r.get('state',''))" \
+      2>/dev/null || echo "")
+    echo -n "."
+    if [ "${state}" = "IndexFinished" ]; then
+      echo ""
+      echo "Indexing complete for ${tag}."
+      break
+    elif [ "${state}" = "IndexError" ]; then
+      echo ""
+      echo "Error: Clair indexer reported IndexError for ${tag}."
+      curl -s "${clair_api}/indexer/api/v1/index_report/${digest}" | python3 -m json.tool 2>/dev/null || true
+      return 1
+    fi
+    sleep 5
+  done
+  echo ""
+
+  if [ "${state}" != "IndexFinished" ]; then
+    echo "Error: Timed out waiting for indexing to complete for ${tag} (last state: ${state})."
+    return 1
+  fi
+
+  # Fetch vulnerability report from matcher
+  echo "Fetching vulnerability report for ${tag}..."
+  http_code=$(curl -s -o "${out}" -w "%{http_code}" \
+    "${clair_api}/matcher/api/v1/vulnerability_report/${digest}")
+  if [[ ! "${http_code}" =~ ^2 ]]; then
+    echo "Error: matcher returned HTTP ${http_code} for ${tag}."
+    cat "${out}" | python3 -m json.tool 2>/dev/null || true
+    return 1
+  fi
+  rm -f "${manifest_file}"
+}
+
 echo "Scanning s390x image..."
-"${CLAIRCTL_BIN}" report \
-  --host http://127.0.0.1:6060/ \
-  --out json \
-  127.0.0.1:5050/target-image:s390x \
-  > "${REPORT_S390X}" \
-  || { echo "Error: clairctl failed to scan s390x image."; exit 1; }
+clair_scan "s390x" "${REPORT_S390X}" \
+  || { echo "Error: Clair scan failed for s390x image."; exit 1; }
 echo "s390x scan finished. Report size: $(wc -c < "${REPORT_S390X}") bytes"
 
 echo "Scanning x86_64 image..."
-"${CLAIRCTL_BIN}" report \
-  --host http://127.0.0.1:6060/ \
-  --out json \
-  127.0.0.1:5050/target-image:x86_64 \
-  > "${REPORT_X86}" \
-  || { echo "Error: clairctl failed to scan x86_64 image."; exit 1; }
+clair_scan "x86_64" "${REPORT_X86}" \
+  || { echo "Error: Clair scan failed for x86_64 image."; exit 1; }
 echo "x86_64 scan finished. Report size: $(wc -c < "${REPORT_X86}") bytes"
 
 # ---------------------------------------------------------
