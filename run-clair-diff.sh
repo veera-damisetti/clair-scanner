@@ -258,37 +258,27 @@ done
 #            by DNS name (container name), and ports are published to the host.
 # ---------------------------------------------------------
 if [ "${HOST_OS}" = "linux" ]; then
-  NET_MODE="host"
   DB_HOST="127.0.0.1"
   CLAIR_HTTP_ADDR="127.0.0.1:6060"
   CLAIR_INTRO_ADDR="127.0.0.1:8089"
-  CLAIR_HTTP_PUBLISH=""
-  CLAIR_INTRO_PUBLISH=""
-  DB_PUBLISH=""
-  REGISTRY_PUBLISH="-p 127.0.0.1:5050:5000"
+  NET_ARGS=(--network=host)
+  DB_PUBLISH_ARGS=()
+  CLAIR_PUBLISH_ARGS=()
+  REGISTRY_PUBLISH_ARGS=(-p 127.0.0.1:5050:5000)
 else
-  # macOS (and any other non-Linux): bridge network with port publishing
+  # macOS (and any other non-Linux): named bridge network + explicit port publishes.
+  # Containers talk to each other by DNS name; ports are forwarded to the Mac host.
   NET_NAME="clair-net"
   "${CONTAINER_ENGINE}" network inspect "${NET_NAME}" &>/dev/null \
     || "${CONTAINER_ENGINE}" network create "${NET_NAME}" >/dev/null
-  NET_MODE="bridge"    # placeholder — actual flag built per-container below
   DB_HOST="clair-db"
   CLAIR_HTTP_ADDR="0.0.0.0:6060"
   CLAIR_INTRO_ADDR="0.0.0.0:8089"
-  CLAIR_HTTP_PUBLISH="-p 127.0.0.1:6060:6060"
-  CLAIR_INTRO_PUBLISH="-p 127.0.0.1:8089:8089"
-  DB_PUBLISH="-p 127.0.0.1:5432:5432"
-  REGISTRY_PUBLISH="-p 127.0.0.1:5050:5000"
+  NET_ARGS=(--network "${NET_NAME}")
+  DB_PUBLISH_ARGS=(-p 127.0.0.1:5432:5432)
+  CLAIR_PUBLISH_ARGS=(-p 127.0.0.1:6060:6060 -p 127.0.0.1:8089:8089)
+  REGISTRY_PUBLISH_ARGS=(-p 127.0.0.1:5050:5000)
 fi
-
-# Helper: build the --network flag(s) for a container
-_net_flags() {
-  if [ "${HOST_OS}" = "linux" ]; then
-    echo "--network=host"
-  else
-    echo "--network=${NET_NAME}"
-  fi
-}
 
 # ---------------------------------------------------------
 # Step 4: Create Clair Configuration
@@ -333,10 +323,9 @@ else
   echo "Using existing persistent volume 'clair-db-data'."
 fi
 
-# shellcheck disable=SC2086
 "${CONTAINER_ENGINE}" run -d --name clair-db \
-  $(_net_flags) \
-  ${DB_PUBLISH} \
+  "${NET_ARGS[@]}" \
+  "${DB_PUBLISH_ARGS[@]}" \
   -v clair-db-data:/var/lib/postgresql/data:z \
   -e POSTGRES_USER=clair \
   -e POSTGRES_DB=clair \
@@ -363,11 +352,9 @@ fi
 # Step 6: Start Clair Combo Container (v4.7.4)
 # ---------------------------------------------------------
 echo "=== Step 6: Starting Clair Combo (v4.7.4) ==="
-# shellcheck disable=SC2086
 "${CONTAINER_ENGINE}" run -d --name clair \
-  $(_net_flags) \
-  ${CLAIR_HTTP_PUBLISH} \
-  ${CLAIR_INTRO_PUBLISH} \
+  "${NET_ARGS[@]}" \
+  "${CLAIR_PUBLISH_ARGS[@]}" \
   -v "${CLAIR_STACK_DIR}/config.yaml:/config/config.yaml:ro,z" \
   --tmpfs /tmp:rw,exec,size=2g \
   -e CLAIR_CONF=/config/config.yaml \
@@ -415,10 +402,9 @@ done
 # Step 7: Start Local Image Registry
 # ---------------------------------------------------------
 echo "=== Step 7: Starting Local Image Registry ==="
-# shellcheck disable=SC2086
 "${CONTAINER_ENGINE}" run -d --name local-registry \
-  $(_net_flags) \
-  ${REGISTRY_PUBLISH} \
+  "${NET_ARGS[@]}" \
+  "${REGISTRY_PUBLISH_ARGS[@]}" \
   docker.io/library/registry:2
 
 local_registry_ready=false
