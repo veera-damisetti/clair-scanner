@@ -51,6 +51,8 @@ EOF
 }
 
 # Parse command line options
+# Collect any bare positional args for the legacy two-image invocation form
+_POSITIONAL_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --s390x)
@@ -76,12 +78,26 @@ while [[ $# -gt 0 ]]; do
     -h|--help)
       usage
       ;;
-    *)
+    -*)
       echo "Unknown option: $1"
       usage
       ;;
+    *)
+      # bare positional argument — collect for legacy two-image form
+      _POSITIONAL_ARGS+=("$1")
+      shift
+      ;;
   esac
 done
+
+# Legacy positional form: <s390x-image> <x86-image>
+# Allows: ./run-clair-diff.sh -a authfile <img1> <img2>
+if [ -z "${IMAGE_S390X}" ] && [ "${#_POSITIONAL_ARGS[@]}" -ge 1 ]; then
+  IMAGE_S390X="${_POSITIONAL_ARGS[0]}"
+fi
+if [ -z "${IMAGE_X86}" ] && [ "${#_POSITIONAL_ARGS[@]}" -ge 2 ]; then
+  IMAGE_X86="${_POSITIONAL_ARGS[1]}"
+fi
 
 # Validate required flags
 if [ -z "${IMAGE_S390X}" ] || [ -z "${IMAGE_X86}" ]; then
@@ -334,9 +350,8 @@ fi
 
 echo "Waiting for PostgreSQL to start..."
 local_postgres_ready=false
-for i in {1..20}; do
+for i in {1..30}; do
   if "${CONTAINER_ENGINE}" exec clair-db psql -U clair -c "SELECT 1;" &>/dev/null; then
-    echo "PostgreSQL is ready!"
     local_postgres_ready=true
     break
   fi
@@ -348,11 +363,39 @@ if [ "${local_postgres_ready}" = "false" ]; then
   exit 1
 fi
 
+# On macOS/bridge, give Postgres a few extra seconds to be fully ready
+# for network connections before Clair tries to connect.
+if [ "${HOST_OS}" != "linux" ]; then
+  echo "Waiting for PostgreSQL network socket to be fully ready..."
+  for i in {1..10}; do
+    if "${CONTAINER_ENGINE}" exec clair-db \
+        psql -U clair -c "SELECT pg_postmaster_start_time();" &>/dev/null; then
+      # Also verify it accepts a connection through the bridge network
+      if "${CONTAINER_ENGINE}" run --rm \
+          "${NET_ARGS[@]}" \
+          docker.io/library/postgres:15 \
+          psql "postgresql://clair@clair-db/clair?sslmode=disable" \
+          -c "SELECT 1;" &>/dev/null; then
+        echo "PostgreSQL is ready!"
+        break
+      fi
+    fi
+    echo -n "."
+    sleep 2
+  done
+  echo ""
+else
+  echo "PostgreSQL is ready!"
+fi
+
 # ---------------------------------------------------------
 # Step 6: Start Clair Combo Container (v4.7.4)
 # ---------------------------------------------------------
 echo "=== Step 6: Starting Clair Combo (v4.7.4) ==="
+# --restart=on-failure:5 lets Clair retry if it starts before Postgres
+# finishes accepting connections (important on macOS bridge networking).
 "${CONTAINER_ENGINE}" run -d --name clair \
+  --restart=on-failure:5 \
   "${NET_ARGS[@]}" \
   "${CLAIR_PUBLISH_ARGS[@]}" \
   -v "${CLAIR_STACK_DIR}/config.yaml:/config/config.yaml:ro,z" \
@@ -362,22 +405,26 @@ echo "=== Step 6: Starting Clair Combo (v4.7.4) ==="
   quay.io/projectquay/clair:4.7.4 \
   -conf /config/config.yaml
 
-echo "Waiting for Clair health check..."
+echo "Waiting for Clair health check (API on :6060)..."
 local_clair_ready=false
-for i in {1..30}; do
-  if curl -s -f http://127.0.0.1:8089/healthz &>/dev/null; then
+for i in {1..40}; do
+  # Check the API port directly — 8089 can answer even when Clair has crashed.
+  if curl -s -f http://127.0.0.1:6060/healthz &>/dev/null || \
+     curl -s -f "http://127.0.0.1:6060/indexer/api/v1/index_report/sha256:0000000000000000000000000000000000000000000000000000000000000000" \
+       -o /dev/null -w "%{http_code}" 2>/dev/null | grep -qE "^(200|404|400)"; then
     echo "Clair is up and healthy!"
     local_clair_ready=true
     break
   fi
   echo -n "."
-  sleep 2
+  sleep 3
 done
 echo ""
 
 if [ "${local_clair_ready}" = "false" ]; then
   echo "Error: Clair failed to pass health checks."
-  "${CONTAINER_ENGINE}" logs clair --tail 20
+  echo "--- Clair logs ---"
+  "${CONTAINER_ENGINE}" logs clair --tail 30
   exit 1
 fi
 
@@ -436,22 +483,28 @@ NORM_X86="${IMAGE_X86}"
 echo "s390x image : ${IMAGE_S390X}"
 echo "x86_64 image: ${IMAGE_X86}"
 
-# Build skopeo options — arch is known from the flags, no inspect needed
-SKOPEO_OPTS_S390X=("--dest-tls-verify=false" "--override-arch" "s390x")
-SKOPEO_OPTS_X86=("--dest-tls-verify=false" "--override-arch" "amd64")
+# Build skopeo options — arch is known from the flags, no inspect needed.
+# --override-os linux  : required for manifest-list images (OCP ART images are multi-arch)
+# --override-arch      : select the correct platform layer from the manifest list
+SKOPEO_OPTS_S390X=("--dest-tls-verify=false" "--override-os" "linux" "--override-arch" "s390x")
+SKOPEO_OPTS_X86=("--dest-tls-verify=false"   "--override-os" "linux" "--override-arch" "amd64")
 
 if [ -n "${AUTHFILE}" ] && [ -f "${AUTHFILE}" ]; then
   SKOPEO_OPTS_S390X+=("--authfile" "${AUTHFILE}")
   SKOPEO_OPTS_X86+=("--authfile" "${AUTHFILE}")
 fi
 
-echo "Copying s390x image..."
-skopeo copy "${SKOPEO_OPTS_S390X[@]}" "${NORM_S390X}" "docker://127.0.0.1:5050/target-image:s390x"
-echo "s390x copy complete."
+echo "Copying s390x image (this may take several minutes for large OCP images)..."
+skopeo copy --preserve-digests "${SKOPEO_OPTS_S390X[@]}" \
+  "${NORM_S390X}" "docker://127.0.0.1:5050/target-image:s390x" \
+  && echo "s390x copy complete." \
+  || { echo "ERROR: skopeo copy failed for s390x image. Check auth and network."; exit 1; }
 
-echo "Copying x86_64 image..."
-skopeo copy "${SKOPEO_OPTS_X86[@]}" "${NORM_X86}" "docker://127.0.0.1:5050/target-image:x86_64"
-echo "x86_64 copy complete."
+echo "Copying x86_64 image (this may take several minutes for large OCP images)..."
+skopeo copy --preserve-digests "${SKOPEO_OPTS_X86[@]}" \
+  "${NORM_X86}" "docker://127.0.0.1:5050/target-image:x86_64" \
+  && echo "x86_64 copy complete." \
+  || { echo "ERROR: skopeo copy failed for x86_64 image. Check auth and network."; exit 1; }
 
 # Confirm tags list
 echo "Tags in local registry:"
