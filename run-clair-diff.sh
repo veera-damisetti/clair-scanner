@@ -580,8 +580,20 @@ clair_scan() {
   fi
 
   # macOS: clairctl manifest → rewrite URLs → POST to indexer → poll → fetch report
-  "${CLAIRCTL_BIN}" manifest "${host_ref}" > "${manifest_file}" 2>/dev/null \
-    || { echo "Error: clairctl manifest failed for ${tag}."; return 1; }
+  local manifest_err="/tmp/clair-manifest-err-${tag}-$$.txt"
+  "${CLAIRCTL_BIN}" manifest "${host_ref}" > "${manifest_file}" 2>"${manifest_err}" || {
+    echo "Error: clairctl manifest failed for ${tag}."
+    cat "${manifest_err}" >&2
+    rm -f "${manifest_err}"
+    return 1
+  }
+  rm -f "${manifest_err}"
+
+  # Validate manifest has content (clairctl exits 0 but writes nothing on some errors)
+  if [ ! -s "${manifest_file}" ]; then
+    echo "Error: clairctl manifest produced empty output for ${tag}."
+    return 1
+  fi
 
   # Rewrite 127.0.0.1:5050 → host.containers.internal:5050 in layer URLs
   python3 - "${manifest_file}" << 'PYEOF'
@@ -598,6 +610,11 @@ with open(path, "w") as f:
     json.dump(m, f)
 PYEOF
 
+  local layer_count
+  layer_count=$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1])).get('layers',[])))" \
+    "${manifest_file}" 2>/dev/null || echo "?")
+  echo "Manifest built: ${layer_count} layer(s)."
+
   # Extract the manifest digest (the "hash" field)
   local digest
   digest=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['hash'])" \
@@ -605,56 +622,73 @@ PYEOF
     || { echo "Error: could not extract manifest digest for ${tag}."; return 1; }
   echo "Submitting manifest ${digest} to Clair indexer..."
 
-  # POST manifest to indexer
+  # POST manifest to indexer.
+  # HTTP 201 = accepted (indexing starting), HTTP 200 = already indexed (check inline state).
+  local post_body="/tmp/clair-post-resp-${tag}-$$.json"
   local http_code
-  http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+  http_code=$(curl -s -o "${post_body}" -w "%{http_code}" \
     -X POST "${clair_api}/indexer/api/v1/index_report" \
     -H "Content-Type: application/json" \
     --data-binary "@${manifest_file}")
+
   if [[ ! "${http_code}" =~ ^2 ]]; then
     echo "Error: indexer POST returned HTTP ${http_code} for ${tag}."
-    curl -s -X POST "${clair_api}/indexer/api/v1/index_report" \
-      -H "Content-Type: application/json" \
-      --data-binary "@${manifest_file}" | python3 -m json.tool 2>/dev/null || true
+    python3 -m json.tool < "${post_body}" 2>/dev/null || cat "${post_body}"
+    rm -f "${post_body}" "${manifest_file}"
     return 1
   fi
-  echo "Indexing started (HTTP ${http_code}). Waiting for completion..."
 
-  # Poll until state == IndexFinished or IndexError
-  local state=""
-  for i in {1..120}; do
-    state=$(curl -s "${clair_api}/indexer/api/v1/index_report/${digest}" \
-      | python3 -c "import sys,json; r=json.load(sys.stdin); print(r.get('state',''))" \
-      2>/dev/null || echo "")
-    echo -n "."
-    if [ "${state}" = "IndexFinished" ]; then
-      echo ""
-      echo "Indexing complete for ${tag}."
-      break
-    elif [ "${state}" = "IndexError" ]; then
-      echo ""
-      echo "Error: Clair indexer reported IndexError for ${tag}."
-      curl -s "${clair_api}/indexer/api/v1/index_report/${digest}" | python3 -m json.tool 2>/dev/null || true
+  # If already indexed (200) and state is already IndexFinished, skip polling
+  local inline_state
+  inline_state=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('state',''))" \
+    "${post_body}" 2>/dev/null || echo "")
+  rm -f "${post_body}"
+
+  if [ "${inline_state}" = "IndexFinished" ]; then
+    echo "Already indexed (HTTP ${http_code}). Skipping poll."
+  else
+    echo "Indexing started (HTTP ${http_code}). Waiting for completion (up to 15 min)..."
+    # Poll until state == IndexFinished or IndexError
+    # 180 × 5s = 15 min — enough for large OCP images (50-100 MB layers via bridge)
+    local state=""
+    for i in {1..180}; do
+      state=$(curl -s "${clair_api}/indexer/api/v1/index_report/${digest}" \
+        | python3 -c "import sys,json; r=json.load(sys.stdin); print(r.get('state',''))" \
+        2>/dev/null || echo "")
+      echo -n "."
+      if [ "${state}" = "IndexFinished" ]; then
+        echo ""
+        echo "Indexing complete for ${tag}."
+        break
+      elif [ "${state}" = "IndexError" ]; then
+        echo ""
+        echo "Error: Clair indexer reported IndexError for ${tag}."
+        curl -s "${clair_api}/indexer/api/v1/index_report/${digest}" \
+          | python3 -m json.tool 2>/dev/null || true
+        return 1
+      fi
+      sleep 5
+    done
+    echo ""
+
+    if [ "${state}" != "IndexFinished" ]; then
+      echo "Error: Timed out waiting for indexing of ${tag} (last state: '${state}')."
       return 1
     fi
-    sleep 5
-  done
-  echo ""
-
-  if [ "${state}" != "IndexFinished" ]; then
-    echo "Error: Timed out waiting for indexing to complete for ${tag} (last state: ${state})."
-    return 1
   fi
 
   # Fetch vulnerability report from matcher
   echo "Fetching vulnerability report for ${tag}..."
-  http_code=$(curl -s -o "${out}" -w "%{http_code}" \
+  local vuln_resp="/tmp/clair-vuln-resp-${tag}-$$.json"
+  http_code=$(curl -s -o "${vuln_resp}" -w "%{http_code}" \
     "${clair_api}/matcher/api/v1/vulnerability_report/${digest}")
   if [[ ! "${http_code}" =~ ^2 ]]; then
     echo "Error: matcher returned HTTP ${http_code} for ${tag}."
-    cat "${out}" | python3 -m json.tool 2>/dev/null || true
+    python3 -m json.tool < "${vuln_resp}" 2>/dev/null || cat "${vuln_resp}"
+    rm -f "${vuln_resp}"
     return 1
   fi
+  mv "${vuln_resp}" "${out}"
   rm -f "${manifest_file}"
 }
 
