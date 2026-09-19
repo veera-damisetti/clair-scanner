@@ -723,6 +723,49 @@ def fmt_ts(ts: str) -> str:
 
 
 # ===========================================================================
+# Raw JSON section helper
+# ===========================================================================
+def _render_json_section(pdf, report: dict):
+    """
+    Append a 'Raw Scan JSON' section to *pdf*.
+    Pretty-prints the full clairctl vulnerability report as monospace text,
+    split across as many pages as needed.
+    """
+    pdf.spacer(10)
+    pdf.h2("Raw Clair Scan JSON Output")
+    pdf.body(
+        "The complete JSON payload returned by the Clair matcher API is reproduced "
+        "below for audit and traceability purposes.",
+        size=8, color=(0.34, 0.38, 0.42),
+    )
+    pdf.spacer(6)
+
+    # Pretty-print with 2-space indent; fall back gracefully if not a dict
+    try:
+        raw_text = json.dumps(report, indent=2, ensure_ascii=False)
+    except Exception:
+        raw_text = str(report)
+
+    # Render line-by-line so the PDF page-break logic works correctly.
+    # Use a small monospace-like size (7pt) and fixed line height.
+    size = 7
+    lh   = size + 2   # 9 pt line height — compact but readable
+    max_w = pdf._pw
+
+    for raw_line in raw_text.splitlines():
+        # Wrap long lines at the printable width
+        wrapped = pdf._wrap_lines(raw_line if raw_line.strip() else " ", max_w, size)
+        for segment in wrapped:
+            pdf._need(lh + 2)
+            pdf._font(bold=False, size=size)
+            pdf._rgb(0.15, 0.17, 0.20)
+            pdf._text(pdf.ML, pdf._y - size, segment)
+            pdf._y -= lh
+    pdf._dark()
+    pdf.spacer(8)
+
+
+# ===========================================================================
 # Individual image PDF
 # ===========================================================================
 def build_individual_pdf(report_path, meta_path, image_ref, label, output_path):
@@ -802,6 +845,9 @@ def build_individual_pdf(report_path, meta_path, image_ref, label, output_path):
         pdf.body("No vulnerabilities detected in this image.", color=(0.22, 0.60, 0.29))
     else:
         pdf.cve_table(group_by_sev(cves))
+
+    # ---------------------------------------------------------------  Raw JSON output
+    _render_json_section(pdf, report)
 
     pdf.save(output_path)
 
