@@ -230,6 +230,10 @@ cleanup() {
       "${CONTAINER_ENGINE}" rm "${c}" &>/dev/null || true
     fi
   done
+  # Remove the bridge network created for macOS runs
+  if [ "${HOST_OS:-}" != "linux" ] && [ -n "${NET_NAME:-}" ]; then
+    "${CONTAINER_ENGINE}" network rm "${NET_NAME}" &>/dev/null || true
+  fi
   echo "Cleanup complete."
 }
 
@@ -246,22 +250,63 @@ for c in clair clair-db local-registry; do
 done
 
 # ---------------------------------------------------------
+# Networking strategy
+# On Linux:  --network=host  → containers share host loopback; all services
+#            bind/reach each other on 127.0.0.1.
+# On macOS:  --network=host is a no-op (containers run in a Linux VM).
+#            Use a named bridge network instead; containers reach each other
+#            by DNS name (container name), and ports are published to the host.
+# ---------------------------------------------------------
+if [ "${HOST_OS}" = "linux" ]; then
+  NET_MODE="host"
+  DB_HOST="127.0.0.1"
+  CLAIR_HTTP_ADDR="127.0.0.1:6060"
+  CLAIR_INTRO_ADDR="127.0.0.1:8089"
+  CLAIR_HTTP_PUBLISH=""
+  CLAIR_INTRO_PUBLISH=""
+  DB_PUBLISH=""
+  REGISTRY_PUBLISH="-p 127.0.0.1:5050:5000"
+else
+  # macOS (and any other non-Linux): bridge network with port publishing
+  NET_NAME="clair-net"
+  "${CONTAINER_ENGINE}" network inspect "${NET_NAME}" &>/dev/null \
+    || "${CONTAINER_ENGINE}" network create "${NET_NAME}" >/dev/null
+  NET_MODE="bridge"    # placeholder — actual flag built per-container below
+  DB_HOST="clair-db"
+  CLAIR_HTTP_ADDR="0.0.0.0:6060"
+  CLAIR_INTRO_ADDR="0.0.0.0:8089"
+  CLAIR_HTTP_PUBLISH="-p 127.0.0.1:6060:6060"
+  CLAIR_INTRO_PUBLISH="-p 127.0.0.1:8089:8089"
+  DB_PUBLISH="-p 127.0.0.1:5432:5432"
+  REGISTRY_PUBLISH="-p 127.0.0.1:5050:5000"
+fi
+
+# Helper: build the --network flag(s) for a container
+_net_flags() {
+  if [ "${HOST_OS}" = "linux" ]; then
+    echo "--network=host"
+  else
+    echo "--network=${NET_NAME}"
+  fi
+}
+
+# ---------------------------------------------------------
 # Step 4: Create Clair Configuration
 # ---------------------------------------------------------
 echo "=== Step 4: Creating Clair Configuration ==="
-cat > "${CLAIR_STACK_DIR}/config.yaml" << 'EOF'
-http_listen_addr: "127.0.0.1:6060"
-introspection_addr: "127.0.0.1:8089"
+cat > "${CLAIR_STACK_DIR}/config.yaml" << EOF
+http_listen_addr: "${CLAIR_HTTP_ADDR}"
+introspection_addr: "${CLAIR_INTRO_ADDR}"
 log_level: "warn"
 indexer:
-  connstring: "host=127.0.0.1 port=5432 user=clair dbname=clair sslmode=disable"
+  connstring: "host=${DB_HOST} port=5432 user=clair dbname=clair sslmode=disable"
   migrations: true
   layer_scan_concurrency: 2
 matcher:
-  connstring: "host=127.0.0.1 port=5432 user=clair dbname=clair sslmode=disable"
+  connstring: "host=${DB_HOST} port=5432 user=clair dbname=clair sslmode=disable"
   migrations: true
 notifier:
-  connstring: "host=127.0.0.1 port=5432 user=clair dbname=clair sslmode=disable"
+  connstring: "host=${DB_HOST} port=5432 user=clair dbname=clair sslmode=disable"
   migrations: true
 updaters:
   sets:
@@ -280,8 +325,7 @@ echo "Configuration created at ${CLAIR_STACK_DIR}/config.yaml"
 # Step 5: Start PostgreSQL with Host Storage Volume
 # ---------------------------------------------------------
 echo "=== Step 5: Starting PostgreSQL ==="
-# We create a persistent database volume for postgres to persist vulnerability data across runs.
-# This makes subsequent runs instantaneous instead of waiting 3-5 mins!
+# Persistent volume keeps the vuln DB between runs — subsequent runs are instant.
 if ! "${CONTAINER_ENGINE}" volume inspect clair-db-data &>/dev/null; then
   "${CONTAINER_ENGINE}" volume create clair-db-data >/dev/null
   echo "Created persistent volume 'clair-db-data'."
@@ -289,8 +333,10 @@ else
   echo "Using existing persistent volume 'clair-db-data'."
 fi
 
+# shellcheck disable=SC2086
 "${CONTAINER_ENGINE}" run -d --name clair-db \
-  --network=host \
+  $(_net_flags) \
+  ${DB_PUBLISH} \
   -v clair-db-data:/var/lib/postgresql/data:z \
   -e POSTGRES_USER=clair \
   -e POSTGRES_DB=clair \
@@ -317,8 +363,11 @@ fi
 # Step 6: Start Clair Combo Container (v4.7.4)
 # ---------------------------------------------------------
 echo "=== Step 6: Starting Clair Combo (v4.7.4) ==="
+# shellcheck disable=SC2086
 "${CONTAINER_ENGINE}" run -d --name clair \
-  --network=host \
+  $(_net_flags) \
+  ${CLAIR_HTTP_PUBLISH} \
+  ${CLAIR_INTRO_PUBLISH} \
   -v "${CLAIR_STACK_DIR}/config.yaml:/config/config.yaml:ro,z" \
   --tmpfs /tmp:rw,exec,size=2g \
   -e CLAIR_CONF=/config/config.yaml \
@@ -366,8 +415,10 @@ done
 # Step 7: Start Local Image Registry
 # ---------------------------------------------------------
 echo "=== Step 7: Starting Local Image Registry ==="
+# shellcheck disable=SC2086
 "${CONTAINER_ENGINE}" run -d --name local-registry \
-  -p 127.0.0.1:5050:5000 \
+  $(_net_flags) \
+  ${REGISTRY_PUBLISH} \
   docker.io/library/registry:2
 
 local_registry_ready=false
