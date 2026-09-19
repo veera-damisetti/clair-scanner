@@ -280,7 +280,10 @@ if [ "${HOST_OS}" = "linux" ]; then
   NET_ARGS=(--network=host)
   DB_PUBLISH_ARGS=()
   CLAIR_PUBLISH_ARGS=()
-  REGISTRY_PUBLISH_ARGS=(-p 127.0.0.1:5050:5000)
+  # With --network=host, -p port mappings are silently discarded by podman/docker.
+  # The registry container binds directly to the host network on its default port 5000.
+  REGISTRY_PUBLISH_ARGS=()
+  REGISTRY_PORT=5000
 else
   # macOS (and any other non-Linux): named bridge network + explicit port publishes.
   # Containers talk to each other by DNS name; ports are forwarded to the Mac host.
@@ -294,6 +297,7 @@ else
   DB_PUBLISH_ARGS=(-p 127.0.0.1:5432:5432)
   CLAIR_PUBLISH_ARGS=(-p 127.0.0.1:6060:6060 -p 127.0.0.1:8089:8089)
   REGISTRY_PUBLISH_ARGS=(-p 127.0.0.1:5050:5000)
+  REGISTRY_PORT=5050
 fi
 
 # ---------------------------------------------------------
@@ -392,7 +396,7 @@ fi
 # Step 6: Start Local Image Registry (must be up before Clair on macOS)
 # ---------------------------------------------------------
 # The registry must start before Clair so that on macOS, Clair's container
-# can reach it via host.containers.internal:5050 for layer fetching.
+# can reach it via host.containers.internal:${REGISTRY_PORT} for layer fetching.
 echo "=== Step 6: Starting Local Image Registry ==="
 "${CONTAINER_ENGINE}" run -d --name local-registry \
   "${NET_ARGS[@]}" \
@@ -401,8 +405,8 @@ echo "=== Step 6: Starting Local Image Registry ==="
 
 local_registry_ready=false
 for i in {1..10}; do
-  if curl -s http://127.0.0.1:5050/v2/ &>/dev/null; then
-    echo "Local registry is up on 127.0.0.1:5050!"
+  if curl -s "http://127.0.0.1:${REGISTRY_PORT}/v2/" &>/dev/null; then
+    echo "Local registry is up on 127.0.0.1:${REGISTRY_PORT}!"
     local_registry_ready=true
     break
   fi
@@ -420,11 +424,9 @@ fi
 echo "=== Step 7: Starting Clair Combo (v4.7.4) ==="
 
 # On macOS (bridge networking), Clair fetches image layers from inside its
-# own container. It cannot use 127.0.0.1:5050 (that's the host-side port).
-# --add-host=host.containers.internal:host-gateway makes the host's
-# 127.0.0.1 reachable from inside the container as host.containers.internal.
-# We later rewrite manifest layer URLs to use that hostname before submitting
-# to Clair's indexer API.
+# own container. It cannot reach 127.0.0.1:${REGISTRY_PORT} (host-side port).
+# --add-host=host.containers.internal:host-gateway maps the host's IP into
+# the container so layer URLs can be rewritten to host.containers.internal.
 CLAIR_EXTRA_ARGS=()
 if [ "${HOST_OS}" != "linux" ]; then
   CLAIR_EXTRA_ARGS+=(--add-host=host.containers.internal:host-gateway)
@@ -512,19 +514,19 @@ fi
 
 echo "Copying s390x image (this may take several minutes for large OCP images)..."
 skopeo copy --preserve-digests "${SKOPEO_OPTS_S390X[@]}" \
-  "${NORM_S390X}" "docker://127.0.0.1:5050/target-image:s390x" \
+  "${NORM_S390X}" "docker://127.0.0.1:${REGISTRY_PORT}/target-image:s390x" \
   && echo "s390x copy complete." \
   || { echo "ERROR: skopeo copy failed for s390x image. Check auth and network."; exit 1; }
 
 echo "Copying x86_64 image (this may take several minutes for large OCP images)..."
 skopeo copy --preserve-digests "${SKOPEO_OPTS_X86[@]}" \
-  "${NORM_X86}" "docker://127.0.0.1:5050/target-image:x86_64" \
+  "${NORM_X86}" "docker://127.0.0.1:${REGISTRY_PORT}/target-image:x86_64" \
   && echo "x86_64 copy complete." \
   || { echo "ERROR: skopeo copy failed for x86_64 image. Check auth and network."; exit 1; }
 
 # Confirm tags list
 echo "Tags in local registry:"
-curl -s http://127.0.0.1:5050/v2/target-image/tags/list
+curl -s "http://127.0.0.1:${REGISTRY_PORT}/v2/target-image/tags/list"
 
 # ---------------------------------------------------------
 # Step 9: Inspect images from local registry (no network needed)
@@ -533,24 +535,24 @@ echo "=== Step 9: Inspecting images from local registry ==="
 META_S390X="/tmp/clair-meta-s390x-$$.json"
 META_X86="/tmp/clair-meta-x86-$$.json"
 
-skopeo inspect --tls-verify=false "docker://127.0.0.1:5050/target-image:s390x" > "${META_S390X}" \
+skopeo inspect --tls-verify=false "docker://127.0.0.1:${REGISTRY_PORT}/target-image:s390x" > "${META_S390X}" \
   || { echo "Warning: skopeo inspect failed for s390x; metadata will be unavailable."; echo "{}" > "${META_S390X}"; }
 echo "s390x metadata collected."
 
-skopeo inspect --tls-verify=false "docker://127.0.0.1:5050/target-image:x86_64" > "${META_X86}" \
+skopeo inspect --tls-verify=false "docker://127.0.0.1:${REGISTRY_PORT}/target-image:x86_64" > "${META_X86}" \
   || { echo "Warning: skopeo inspect failed for x86_64; metadata will be unavailable."; echo "{}" > "${META_X86}"; }
 echo "x86_64 metadata collected."
 
 # ---------------------------------------------------------
 # Step 10: Scan both images with Clair
 # ---------------------------------------------------------
-# On Linux (--network=host) clairctl can submit 127.0.0.1:5050 directly —
-# Clair's indexer also sees 127.0.0.1:5050 and fetches layers fine.
+# On Linux (--network=host) clairctl submits 127.0.0.1:${REGISTRY_PORT} directly —
+# Clair's indexer shares the host network and fetches layers from the same address.
 #
-# On macOS (bridge network), Clair's container cannot reach 127.0.0.1:5050
+# On macOS (bridge network), Clair's container cannot reach 127.0.0.1:${REGISTRY_PORT}
 # (that is a host-side port mapping). We use a two-step approach:
-#   1. clairctl manifest builds the manifest JSON (host sees 127.0.0.1:5050 ✓)
-#   2. Python rewrites layer URLs: 127.0.0.1:5050 → host.containers.internal:5050
+#   1. clairctl manifest builds the manifest JSON (host sees 127.0.0.1:${REGISTRY_PORT} ✓)
+#   2. Python rewrites layer URLs: 127.0.0.1:${REGISTRY_PORT} → host.containers.internal:${REGISTRY_PORT}
 #      (the Clair container can reach that via --add-host added above)
 #   3. POST the rewritten manifest to Clair's indexer REST API directly
 #   4. Poll until indexing is complete, then fetch the vuln report
@@ -563,7 +565,7 @@ REPORT_X86="/tmp/clair-report-x86-$$.json"
 clair_scan() {
   local tag="$1"
   local out="$2"
-  local host_ref="127.0.0.1:5050/target-image:${tag}"
+  local host_ref="127.0.0.1:${REGISTRY_PORT}/target-image:${tag}"
   local clair_api="http://127.0.0.1:6060"
 
   echo "Building manifest for ${tag}..."
@@ -595,16 +597,18 @@ clair_scan() {
     return 1
   fi
 
-  # Rewrite 127.0.0.1:5050 → host.containers.internal:5050 in layer URLs
-  python3 - "${manifest_file}" << 'PYEOF'
-import sys, json
+  # Rewrite 127.0.0.1:${REGISTRY_PORT} → host.containers.internal:${REGISTRY_PORT}
+  # Pass REGISTRY_PORT as an env var since the heredoc uses 'PYEOF' (no expansion inside)
+  REGISTRY_PORT="${REGISTRY_PORT}" python3 - "${manifest_file}" << 'PYEOF'
+import sys, json, os
 path = sys.argv[1]
+port = os.environ["REGISTRY_PORT"]
 with open(path) as f:
     m = json.load(f)
 for layer in m.get("layers", []):
     if "uri" in layer:
         layer["uri"] = layer["uri"].replace(
-            "127.0.0.1:5050", "host.containers.internal:5050"
+            f"127.0.0.1:{port}", f"host.containers.internal:{port}"
         )
 with open(path, "w") as f:
     json.dump(m, f)
