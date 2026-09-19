@@ -106,14 +106,55 @@ mkdir -p "${OUTPUT_DIR}"
 OUTPUT_DIR=$(cd "${OUTPUT_DIR}" && pwd)
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
+# Detect OS early — needed by container engine selection below
+HOST_OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+
 # ---------------------------------------------------------
 # Step 1: Pre-flight & Dependency Checks
 # ---------------------------------------------------------
 echo "=== Step 1: Pre-flight & Dependency Checks ==="
-# Check container engine (support both podman and docker)
 CONTAINER_ENGINE=""
+# On macOS, podman requires a running podman machine (Linux VM).
+# Try to ensure the machine is up before committing to podman.
+_ensure_podman_machine() {
+  # Already reachable — nothing to do
+  if podman info &>/dev/null 2>&1; then
+    return 0
+  fi
+  echo "Podman socket not reachable. Attempting to start podman machine..."
+  # If no machine exists at all, initialise a default one
+  if ! podman machine list --format '{{.Name}}' 2>/dev/null | grep -q .; then
+    echo "No podman machine found. Running 'podman machine init' (this may take a few minutes)..."
+    podman machine init || return 1
+  fi
+  podman machine start 2>&1 | grep -v "^$" || true
+  # Give the socket a moment to appear
+  for i in {1..10}; do
+    if podman info &>/dev/null 2>&1; then
+      echo "Podman machine is up."
+      return 0
+    fi
+    sleep 2
+  done
+  echo "Warning: podman machine did not become ready in time."
+  return 1
+}
+
 if command -v podman &>/dev/null; then
-  CONTAINER_ENGINE="podman"
+  if [ "${HOST_OS:-$(uname -s | tr '[:upper:]' '[:lower:]')}" = "darwin" ]; then
+    if _ensure_podman_machine; then
+      CONTAINER_ENGINE="podman"
+    elif command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
+      echo "Podman machine unavailable; falling back to Docker."
+      CONTAINER_ENGINE="docker"
+    else
+      echo "Error: Podman machine could not start and Docker is not available."
+      echo "Run 'podman machine init && podman machine start' manually, then retry."
+      exit 1
+    fi
+  else
+    CONTAINER_ENGINE="podman"
+  fi
 elif command -v docker &>/dev/null; then
   CONTAINER_ENGINE="docker"
 else
@@ -131,8 +172,7 @@ for cmd in "${PREREQS[@]}"; do
 done
 echo "All system dependencies verified: ${CONTAINER_ENGINE}, skopeo, curl, python3"
 
-# Detect Host Operating System
-HOST_OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+# Derive CLAIR_OS from HOST_OS (already set above)
 case "${HOST_OS}" in
   darwin) CLAIR_OS="darwin" ;;
   linux) CLAIR_OS="linux" ;;
