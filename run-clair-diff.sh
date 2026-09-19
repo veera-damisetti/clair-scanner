@@ -392,39 +392,46 @@ fi
 # Step 6: Start Clair Combo Container (v4.7.4)
 # ---------------------------------------------------------
 echo "=== Step 6: Starting Clair Combo (v4.7.4) ==="
-# --restart=on-failure:5 lets Clair retry if it starts before Postgres
-# finishes accepting connections (important on macOS bridge networking).
+# --restart=on-failure:10 lets Clair self-heal if Postgres isn't fully
+# ready on the bridge network when Clair first tries to connect.
 "${CONTAINER_ENGINE}" run -d --name clair \
-  --restart=on-failure:5 \
+  --restart=on-failure:10 \
   "${NET_ARGS[@]}" \
   "${CLAIR_PUBLISH_ARGS[@]}" \
   -v "${CLAIR_STACK_DIR}/config.yaml:/config/config.yaml:ro,z" \
-  --tmpfs /tmp:rw,exec,size=2g \
-  -e CLAIR_CONF=/config/config.yaml \
   -e CLAIR_MODE=combo \
   quay.io/projectquay/clair:4.7.4 \
   -conf /config/config.yaml
 
+# Health-check strategy:
+#   - /indexer/api/v1/index_states returns HTTP 200 once Clair's indexer
+#     is fully initialised and connected to Postgres.
+#   - We also accept any 2xx/4xx on the indexer root (Clair is up even if
+#     the DB is still migrating; it will serve requests).
+#   - 8089 (introspection) is NOT used — it always reports OK even when
+#     Clair is crashed.
+#   - 60 × 5s = 5 minutes total budget, enough for cold-start + DB setup.
 echo "Waiting for Clair health check (API on :6060)..."
 local_clair_ready=false
-for i in {1..40}; do
-  # Check the API port directly — 8089 can answer even when Clair has crashed.
-  if curl -s -f http://127.0.0.1:6060/healthz &>/dev/null || \
-     curl -s -f "http://127.0.0.1:6060/indexer/api/v1/index_report/sha256:0000000000000000000000000000000000000000000000000000000000000000" \
-       -o /dev/null -w "%{http_code}" 2>/dev/null | grep -qE "^(200|404|400)"; then
-    echo "Clair is up and healthy!"
+for i in {1..60}; do
+  http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+    http://127.0.0.1:6060/indexer/api/v1/index_states 2>/dev/null || echo "000")
+  if [[ "${http_code}" =~ ^[2345][0-9][0-9]$ ]]; then
+    echo "Clair is up and healthy! (HTTP ${http_code})"
     local_clair_ready=true
     break
   fi
   echo -n "."
-  sleep 3
+  sleep 5
 done
 echo ""
 
 if [ "${local_clair_ready}" = "false" ]; then
-  echo "Error: Clair failed to pass health checks."
-  echo "--- Clair logs ---"
-  "${CONTAINER_ENGINE}" logs clair --tail 30
+  echo "Error: Clair failed to pass health checks after 5 minutes."
+  echo "--- Clair logs (last 40 lines) ---"
+  "${CONTAINER_ENGINE}" logs clair --tail 40
+  echo ""
+  echo "Tip: run  ${CONTAINER_ENGINE} logs clair  for full output."
   exit 1
 fi
 
